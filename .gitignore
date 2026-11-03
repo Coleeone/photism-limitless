@@ -1,0 +1,20 @@
+# Build artifacts
+build/
+*.obj
+*.exp
+*.lib
+*.res
+*.rr
+*.ilk
+*.pdb
+
+# Visual Studio / IDE
+.vs/
+.vscode/
+x64/
+Debug/
+Release/
+
+# Temporary files
+*.tmp
+*.bak
