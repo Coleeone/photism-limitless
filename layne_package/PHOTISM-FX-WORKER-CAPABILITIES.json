@@ -1,0 +1,66 @@
+{
+  "worker": "baxter-photism-fx/1",
+  "worker_version": "1.1.0",
+  "contract": "mirror-effectcraft-render/1",
+  "queue_path": "I:\\My Drive\\BAXTER\\BAXTER_PHOTISM_JOBS",
+  "local_root": "F:\\BaxterPhotismBridge",
+  "cli_path": "F:\\BaxterPhotismBridge\\photism-cli.exe",
+  "cli_sha256": "d43136a50f06d763bfc87cefb79f4531b5afa2f441c7ab2ed3fa370a0e465fc6",
+  "supported_modes": [
+    "none",
+    "smear",
+    "droste",
+    "infinite",
+    "corridor",
+    "cube",
+    "planet",
+    "windows",
+    "melt",
+    "shatter",
+    "prism",
+    "terrain",
+    "breathe",
+    "mosh",
+    "sort",
+    "coral",
+    "scanline",
+    "thresh",
+    "solar",
+    "halftone",
+    "vhs"
+  ],
+  "param_allowlist_v2": {
+    "speed": {"type": "number", "min": null, "max": null, "default": 50.0},
+    "chaos": {"type": "number", "min": 0.0, "max": 100.0, "default": 23.0},
+    "trails": {"type": "number", "min": 0.0, "max": 100.0, "default": 82.0},
+    "decay": {"type": "number", "min": 0.0, "max": 100.0, "default": 55.0},
+    "react": {"type": "number", "min": 0.0, "max": 200.0, "default": 36.0},
+    "heat": {"type": "number", "min": 0.0, "max": 100.0, "default": 55.0},
+    "symmetry": {"type": "number", "min": 0.0, "max": 12.0, "default": 0.0},
+    "tiles": {"type": "number", "min": 0.0, "max": 12.0, "default": 0.0},
+    "twist": {"type": "number", "min": 0.0, "max": 100.0, "default": 0.0},
+    "slice": {"type": "number", "min": 0.0, "max": 100.0, "default": 0.0},
+    "lens": {"type": "number", "min": 0.0, "max": 100.0, "default": 0.0},
+    "lens-style": {"type": "integer", "min": 0, "max": 6, "default": 0, "styles": ["Ribs", "Fan", "Anamorphic", "Melt", "Glitch", "Pixels", "FlyEye"]},
+    "hue-drift": {"type": "number", "min": 0.0, "max": 100.0, "default": 0.0},
+    "vignette": {"type": "number", "min": 0.0, "max": 100.0, "default": 0.0},
+    "contrast": {"type": "number", "min": 0.0, "max": 100.0, "default": 98.0},
+    "dry-wet": {"type": "number", "min": 0.0, "max": 100.0, "default": 100.0},
+    "drive-low": {"type": "number", "min": 0.0, "max": 100.0, "default": 0.0},
+    "drive-mid": {"type": "number", "min": 0.0, "max": 100.0, "default": 0.0},
+    "drive-high": {"type": "number", "min": 0.0, "max": 100.0, "default": 0.0},
+    "pulse": {"type": "number", "min": 0.0, "max": 100.0, "default": 0.0}
+  },
+  "manifest_schema": {
+    "schema_version": 1,
+    "required_top_level": ["schema_version", "job_id", "ready", "mode", "params", "input"],
+    "input_fields": ["path", "bytes", "sha256"]
+  },
+  "guards": {
+    "zero_frames": "Job fails with error 'CLI rendered 0 frames' if output contains 0 frames"
+  },
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 5080 (Blackwell sm_120)",
+    "nvenc": true
+  }
+}
