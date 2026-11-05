@@ -331,6 +331,8 @@ RenderCPU(
     float startPhase = 0.0f;
     float speedRate = (p.speed * 0.01f) * (1.0f + (p.react * 0.01f) * (p.driveMid * 0.01f));
     bool needResim = state->CheckSeekAndPrepare(frameIndex, dt, speedRate, startFrame, startPhase);
+    // Deterministic, time-derived phase (matches GPU path; stable across scrubbing and export threads)
+    startPhase = static_cast<float>(frameIndex) * dt * speedRate;
 
     // Query actual pixel format from Premiere Pro so 8-bit, 32-bit, BGRA, and VUYA sequences
     // all decode and encode cleanly during Render In-to-Out (QuickTime preview) and Media Encoder exports.

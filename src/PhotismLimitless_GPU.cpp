@@ -212,7 +212,9 @@ public:
         float startPhase = 0.0f;
         float speedRate = (params.speed * 0.01f) * (1.0f + (params.react * 0.01f) * (params.driveMid * 0.01f));
         bool seekOccurred = state->CheckSeekAndPrepare(params.frameIndex, params.dt, speedRate, startFrame, startPhase);
-        params.phase = startPhase;
+        // Deterministic, time-derived phase: identical in preview, scrub and multi-threaded export
+        (void)startPhase;
+        params.phase = static_cast<float>(params.frameIndex) * params.dt * speedRate;
 
         // Dispatch to Hardware Framework
         if (mDeviceInfo.outDeviceFramework == PrGPUDeviceFramework_CUDA) {
@@ -227,7 +229,8 @@ public:
             cudaStream_t stream = reinterpret_cast<cudaStream_t>(mDeviceInfo.outCommandQueueHandle);
 
             if (seekOccurred && (params.mode == MODE_SMEAR || params.mode == MODE_MELT || params.mode == MODE_MOSH)) {
-                cudaMemcpyAsync(mCudaHistoryA, state->GetCurrentHistory(), width * height * sizeof(float4), cudaMemcpyHostToDevice, stream);
+                // Host history is not downloaded during render (no blocking DMA), so clear instead of uploading stale data
+                cudaMemsetAsync(mCudaHistoryA, 0, static_cast<size_t>(width) * height * sizeof(float4), stream);
             }
 
             // Stage source frame into mCudaSrcCopy on Premiere's active CUDA stream
