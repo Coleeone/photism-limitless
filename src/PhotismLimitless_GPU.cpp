@@ -52,17 +52,20 @@ class PhotismLimitlessGPU : public PrGPUFilterBase {
 public:
     PhotismLimitlessGPU()
         : mCudaHistoryA(nullptr), mCudaHistoryB(nullptr), mCudaGradBuffer(nullptr),
-          mAllocatedPixels(0), mClHistoryA(nullptr), mClHistoryB(nullptr) {}
+          mCudaSrcCopy(nullptr), mAllocatedPixels(0), mClHistoryA(nullptr),
+          mClHistoryB(nullptr), mClSrcCopy(nullptr) {}
 
     virtual ~PhotismLimitlessGPU() {
 #if HAS_CUDA
         if (mCudaHistoryA) cudaFree(mCudaHistoryA);
         if (mCudaHistoryB) cudaFree(mCudaHistoryB);
         if (mCudaGradBuffer) cudaFree(mCudaGradBuffer);
+        if (mCudaSrcCopy) cudaFree(mCudaSrcCopy);
 #endif
 #if HAS_OPENCL
         if (mClHistoryA) clReleaseMemObject(mClHistoryA);
         if (mClHistoryB) clReleaseMemObject(mClHistoryB);
+        if (mClSrcCopy) clReleaseMemObject(mClSrcCopy);
 #endif
     }
 
@@ -121,7 +124,7 @@ public:
         csSDK_size_t inFrameCount,
         PPixHand* outFrame) override
     {
-        if (!inRenderParams || inFrameCount == 0 || !outFrame) return suiteError_Fail;
+        if (!inRenderParams || !outFrame || !*outFrame) return suiteError_Fail;
 
         prRect renderRect;
         mPPixSuite->GetBounds(*outFrame, &renderRect);
@@ -132,18 +135,25 @@ public:
         PrPixelFormat pixelFormat = PrPixelFormat_Invalid;
         mPPixSuite->GetPixelFormat(*outFrame, &pixelFormat);
         int is16f = (pixelFormat != PrPixelFormat_GPU_BGRA_4444_32f);
+        int bytesPerPx = GetGPUBytesPerPixel(pixelFormat);
 
         void* destFrameData = nullptr;
         csSDK_int32 destRowBytes = 0;
         mGPUDeviceSuite->GetGPUPPixData(*outFrame, &destFrameData);
         mPPixSuite->GetRowBytes(*outFrame, &destRowBytes);
-        int destPitch = destRowBytes / GetGPUBytesPerPixel(pixelFormat);
+        int destPitch = destRowBytes / bytesPerPx;
 
         csSDK_int32 srcRowBytes = destRowBytes;
+        void* rawSrcData = destFrameData;
         if (inFrames && inFrameCount > 0 && inFrames[0]) {
             mPPixSuite->GetRowBytes(inFrames[0], &srcRowBytes);
+            mGPUDeviceSuite->GetGPUPPixData(inFrames[0], &rawSrcData);
+            if (!rawSrcData) {
+                rawSrcData = destFrameData;
+                srcRowBytes = destRowBytes;
+            }
         }
-        int srcPitch = srcRowBytes / GetGPUBytesPerPixel(pixelFormat);
+        int srcPitch = width; // We copy into linear mCudaSrcCopy with pitch = width
 
         // Fetch Effect Parameters
         PrTime time = inRenderParams->inClipTime;
@@ -210,39 +220,42 @@ public:
                 cudaMemcpy(mCudaHistoryA, state->GetCurrentHistory(), width * height * sizeof(float4), cudaMemcpyHostToDevice);
             }
 
+            // Stage source frame into mCudaSrcCopy to eliminate in-place read/write race conditions
+            cudaMemcpy2D(
+                mCudaSrcCopy,
+                static_cast<size_t>(width) * bytesPerPx,
+                rawSrcData,
+                static_cast<size_t>(srcRowBytes),
+                static_cast<size_t>(width) * bytesPerPx,
+                static_cast<size_t>(height),
+                cudaMemcpyDeviceToDevice);
+
             float4* destCUDA = reinterpret_cast<float4*>(destFrameData);
+            const float4* srcCUDA = reinterpret_cast<const float4*>(mCudaSrcCopy);
 
-            if (params.mode == MODE_NONE) {
-                LaunchTrivialKernel_CUDA(destCUDA, destPitch, is16f, width, height, params.vignette * 0.01f);
+            LaunchSmearPipeline_CUDA(
+                srcCUDA,
+                reinterpret_cast<float2*>(mCudaGradBuffer),
+                reinterpret_cast<const float4*>(mCudaHistoryA),
+                reinterpret_cast<float4*>(mCudaHistoryB),
+                destCUDA,
+                destPitch,
+                is16f,
+                width,
+                height,
+                params
+            );
+
+            // Ping-pong buffer swap
+            void* tmp = mCudaHistoryA;
+            mCudaHistoryA = mCudaHistoryB;
+            mCudaHistoryB = tmp;
+
+            if (params.frameIndex % 10 == 0) {
+                cudaMemcpy(state->GetCurrentHistory(), mCudaHistoryA, width * height * sizeof(float4), cudaMemcpyDeviceToHost);
+                state->CommitStep(params.frameIndex, params.phase, state->GetCurrentHistory());
             } else {
-                void* srcFrameData = nullptr;
-                mGPUDeviceSuite->GetGPUPPixData(inFrames[0], &srcFrameData);
-                const float4* srcCUDA = reinterpret_cast<const float4*>(srcFrameData ? srcFrameData : destFrameData);
-
-                LaunchSmearPipeline_CUDA(
-                    srcCUDA,
-                    reinterpret_cast<float2*>(mCudaGradBuffer),
-                    reinterpret_cast<const float4*>(mCudaHistoryA),
-                    reinterpret_cast<float4*>(mCudaHistoryB),
-                    destCUDA,
-                    destPitch,
-                    is16f,
-                    width,
-                    height,
-                    params
-                );
-
-                // Ping-pong buffer swap
-                void* tmp = mCudaHistoryA;
-                mCudaHistoryA = mCudaHistoryB;
-                mCudaHistoryB = tmp;
-
-                if (params.frameIndex % 10 == 0) {
-                    cudaMemcpy(state->GetCurrentHistory(), mCudaHistoryA, width * height * sizeof(float4), cudaMemcpyDeviceToHost);
-                    state->CommitStep(params.frameIndex, params.phase, state->GetCurrentHistory());
-                } else {
-                    state->CommitStep(params.frameIndex, params.phase, nullptr);
-                }
+                state->CommitStep(params.frameIndex, params.phase, nullptr);
             }
 
             if (cudaPeekAtLastError() != cudaSuccess) return suiteError_Fail;
@@ -256,58 +269,52 @@ public:
             size_t threadBlock[2] = { 16, 16 };
             size_t grid[2] = { RoundUp(width, threadBlock[0]), RoundUp(height, threadBlock[1]) };
 
-            if (params.mode == MODE_NONE) {
-                float vig = params.vignette * 0.01f;
-                clSetKernelArg(sTrivialKernelCache[mDeviceIndex], 0, sizeof(cl_mem), &destBuffer);
-                clSetKernelArg(sTrivialKernelCache[mDeviceIndex], 1, sizeof(int), &destPitch);
-                clSetKernelArg(sTrivialKernelCache[mDeviceIndex], 2, sizeof(int), &is16f);
-                clSetKernelArg(sTrivialKernelCache[mDeviceIndex], 3, sizeof(int), &width);
-                clSetKernelArg(sTrivialKernelCache[mDeviceIndex], 4, sizeof(int), &height);
-                clSetKernelArg(sTrivialKernelCache[mDeviceIndex], 5, sizeof(float), &vig);
+            EnsureOpenCLBuffers(width, height);
+            cl_mem rawSrcBuffer = reinterpret_cast<cl_mem>(rawSrcData);
+            size_t copySize = static_cast<size_t>(height) * static_cast<size_t>(srcRowBytes);
+            size_t maxCopySize = static_cast<size_t>(width) * static_cast<size_t>(height) * sizeof(float) * 4;
+            clEnqueueCopyBuffer(mCommandQueue, rawSrcBuffer, mClSrcCopy, 0, 0, (std::min)(copySize, maxCopySize), 0, nullptr, nullptr);
 
-                cl_int res = clEnqueueNDRangeKernel(mCommandQueue, sTrivialKernelCache[mDeviceIndex], 2, 0, grid, threadBlock, 0, 0, 0);
-                if (res != CL_SUCCESS) return suiteError_Fail;
-            } else {
-                EnsureOpenCLBuffers(width, height);
-                void* srcFrameData = nullptr;
-                mGPUDeviceSuite->GetGPUPPixData(inFrames[0], &srcFrameData);
-                cl_mem srcBuffer = srcFrameData ? reinterpret_cast<cl_mem>(srcFrameData) : destBuffer;
+            int srcPitchCL = srcRowBytes / bytesPerPx;
+            cl_kernel k = sSmearKernelCache[mDeviceIndex];
+            clSetKernelArg(k, 0, sizeof(cl_mem), &mClSrcCopy);
+            clSetKernelArg(k, 1, sizeof(cl_mem), &mClHistoryA);
+            clSetKernelArg(k, 2, sizeof(cl_mem), &mClHistoryB);
+            clSetKernelArg(k, 3, sizeof(cl_mem), &destBuffer);
+            clSetKernelArg(k, 4, sizeof(int), &destPitch);
+            clSetKernelArg(k, 5, sizeof(int), &is16f);
+            clSetKernelArg(k, 6, sizeof(int), &width);
+            clSetKernelArg(k, 7, sizeof(int), &height);
+            clSetKernelArg(k, 8, sizeof(float), &params.react);
+            clSetKernelArg(k, 9, sizeof(float), &params.chaos);
+            clSetKernelArg(k, 10, sizeof(float), &params.trails);
+            clSetKernelArg(k, 11, sizeof(float), &params.heat);
+            clSetKernelArg(k, 12, sizeof(float), &params.decay);
+            clSetKernelArg(k, 13, sizeof(float), &params.brightness);
+            clSetKernelArg(k, 14, sizeof(float), &params.inputGain);
+            clSetKernelArg(k, 15, sizeof(float), &params.speed);
+            clSetKernelArg(k, 16, sizeof(float), &params.complexity);
+            clSetKernelArg(k, 17, sizeof(float), &params.twist);
+            clSetKernelArg(k, 18, sizeof(float), &params.vignette);
+            clSetKernelArg(k, 19, sizeof(float), &params.dryWet);
+            clSetKernelArg(k, 20, sizeof(float), &params.driveLow);
+            clSetKernelArg(k, 21, sizeof(float), &params.driveMid);
+            clSetKernelArg(k, 22, sizeof(float), &params.driveHigh);
+            clSetKernelArg(k, 23, sizeof(float), &params.pulse);
+            clSetKernelArg(k, 24, sizeof(float), &params.phase);
+            clSetKernelArg(k, 25, sizeof(float), &params.dt);
+            clSetKernelArg(k, 26, sizeof(int), &params.mode);
+            clSetKernelArg(k, 27, sizeof(float), &params.symmetry);
+            clSetKernelArg(k, 28, sizeof(float), &params.tiles);
+            clSetKernelArg(k, 29, sizeof(float), &params.contrast);
+            clSetKernelArg(k, 30, sizeof(int), &srcPitchCL);
 
-                cl_kernel k = sSmearKernelCache[mDeviceIndex];
-                clSetKernelArg(k, 0, sizeof(cl_mem), &srcBuffer);
-                clSetKernelArg(k, 1, sizeof(cl_mem), &mClHistoryA);
-                clSetKernelArg(k, 2, sizeof(cl_mem), &mClHistoryB);
-                clSetKernelArg(k, 3, sizeof(cl_mem), &destBuffer);
-                clSetKernelArg(k, 4, sizeof(int), &destPitch);
-                clSetKernelArg(k, 5, sizeof(int), &is16f);
-                clSetKernelArg(k, 6, sizeof(int), &width);
-                clSetKernelArg(k, 7, sizeof(int), &height);
-                clSetKernelArg(k, 8, sizeof(float), &params.react);
-                clSetKernelArg(k, 9, sizeof(float), &params.chaos);
-                clSetKernelArg(k, 10, sizeof(float), &params.trails);
-                clSetKernelArg(k, 11, sizeof(float), &params.heat);
-                clSetKernelArg(k, 12, sizeof(float), &params.decay);
-                clSetKernelArg(k, 13, sizeof(float), &params.brightness);
-                clSetKernelArg(k, 14, sizeof(float), &params.inputGain);
-                clSetKernelArg(k, 15, sizeof(float), &params.speed);
-                clSetKernelArg(k, 16, sizeof(float), &params.complexity);
-                clSetKernelArg(k, 17, sizeof(float), &params.twist);
-                clSetKernelArg(k, 18, sizeof(float), &params.vignette);
-                clSetKernelArg(k, 19, sizeof(float), &params.dryWet);
-                clSetKernelArg(k, 20, sizeof(float), &params.driveLow);
-                clSetKernelArg(k, 21, sizeof(float), &params.driveMid);
-                clSetKernelArg(k, 22, sizeof(float), &params.driveHigh);
-                clSetKernelArg(k, 23, sizeof(float), &params.pulse);
-                clSetKernelArg(k, 24, sizeof(float), &params.phase);
-                clSetKernelArg(k, 25, sizeof(float), &params.dt);
+            cl_int res = clEnqueueNDRangeKernel(mCommandQueue, k, 2, 0, grid, threadBlock, 0, 0, 0);
+            if (res != CL_SUCCESS) return suiteError_Fail;
 
-                cl_int res = clEnqueueNDRangeKernel(mCommandQueue, k, 2, 0, grid, threadBlock, 0, 0, 0);
-                if (res != CL_SUCCESS) return suiteError_Fail;
-
-                cl_mem tmp = mClHistoryA;
-                mClHistoryA = mClHistoryB;
-                mClHistoryB = tmp;
-            }
+            cl_mem tmp = mClHistoryA;
+            mClHistoryA = mClHistoryB;
+            mClHistoryB = tmp;
             return suiteError_NoError;
 #else
             return suiteError_NotImplemented;
@@ -325,12 +332,15 @@ private:
             if (mCudaHistoryA) cudaFree(mCudaHistoryA);
             if (mCudaHistoryB) cudaFree(mCudaHistoryB);
             if (mCudaGradBuffer) cudaFree(mCudaGradBuffer);
+            if (mCudaSrcCopy) cudaFree(mCudaSrcCopy);
 
             cudaMalloc(&mCudaHistoryA, totalPixels * sizeof(float4));
             cudaMalloc(&mCudaHistoryB, totalPixels * sizeof(float4));
             cudaMalloc(&mCudaGradBuffer, totalPixels * sizeof(float2));
+            cudaMalloc(&mCudaSrcCopy, totalPixels * sizeof(float4));
             cudaMemset(mCudaHistoryA, 0, totalPixels * sizeof(float4));
             cudaMemset(mCudaHistoryB, 0, totalPixels * sizeof(float4));
+            cudaMemset(mCudaSrcCopy, 0, totalPixels * sizeof(float4));
             mAllocatedPixels = totalPixels;
 
             if (state) state->Allocate(width, height);
@@ -344,22 +354,26 @@ private:
         if (totalPixels != mAllocatedPixelsCL) {
             if (mClHistoryA) clReleaseMemObject(mClHistoryA);
             if (mClHistoryB) clReleaseMemObject(mClHistoryB);
+            if (mClSrcCopy) clReleaseMemObject(mClSrcCopy);
 
             cl_context context = (cl_context)mDeviceInfo.outContextHandle;
             mClHistoryA = clCreateBuffer(context, CL_MEM_READ_WRITE, totalPixels * sizeof(float) * 4, nullptr, nullptr);
             mClHistoryB = clCreateBuffer(context, CL_MEM_READ_WRITE, totalPixels * sizeof(float) * 4, nullptr, nullptr);
+            mClSrcCopy  = clCreateBuffer(context, CL_MEM_READ_WRITE, totalPixels * sizeof(float) * 4, nullptr, nullptr);
             mAllocatedPixelsCL = totalPixels;
         }
     }
     cl_command_queue mCommandQueue;
     cl_mem mClHistoryA;
     cl_mem mClHistoryB;
+    cl_mem mClSrcCopy;
     size_t mAllocatedPixelsCL = 0;
 #endif
 
     void* mCudaHistoryA;
     void* mCudaHistoryB;
     void* mCudaGradBuffer;
+    void* mCudaSrcCopy;
     size_t mAllocatedPixels;
 };
 

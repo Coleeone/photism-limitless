@@ -42,6 +42,42 @@ inline float FBM3_CPU(float x, float y) {
     return v;
 }
 
+inline PF_PixelFloat SampleBilinear_CPU(
+    const std::vector<PF_PixelFloat>& src,
+    int width,
+    int height,
+    float u,
+    float v)
+{
+    float wu = Fract(u);
+    float wv = Fract(v);
+    int iu = static_cast<int>(floorf(u));
+    int iv = static_cast<int>(floorf(v));
+    if (iu & 1) wu = 1.0f - wu;
+    if (iv & 1) wv = 1.0f - wv;
+
+    float fx = (std::max)(0.0f, (std::min)(static_cast<float>(width - 1), wu * (width - 1)));
+    float fy = (std::max)(0.0f, (std::min)(static_cast<float>(height - 1), wv * (height - 1)));
+    int x0 = static_cast<int>(floorf(fx));
+    int y0 = static_cast<int>(floorf(fy));
+    int x1 = (std::min)(width - 1, x0 + 1);
+    int y1 = (std::min)(height - 1, y0 + 1);
+    float tx = fx - x0;
+    float ty = fy - y0;
+
+    const PF_PixelFloat& c00 = src[y0 * width + x0];
+    const PF_PixelFloat& c10 = src[y0 * width + x1];
+    const PF_PixelFloat& c01 = src[y1 * width + x0];
+    const PF_PixelFloat& c11 = src[y1 * width + x1];
+
+    PF_PixelFloat out;
+    out.blue  = (1.0f - tx) * (1.0f - ty) * c00.blue  + tx * (1.0f - ty) * c10.blue  + (1.0f - tx) * ty * c01.blue  + tx * ty * c11.blue;
+    out.green = (1.0f - tx) * (1.0f - ty) * c00.green + tx * (1.0f - ty) * c10.green + (1.0f - tx) * ty * c01.green + tx * ty * c11.green;
+    out.red   = (1.0f - tx) * (1.0f - ty) * c00.red   + tx * (1.0f - ty) * c10.red   + (1.0f - tx) * ty * c01.red   + tx * ty * c11.red;
+    out.alpha = c00.alpha;
+    return out;
+}
+
 } // namespace
 
 static PF_Err
@@ -91,11 +127,10 @@ GlobalSetup(
                                                    kPFPixelFormatSuiteVersion1,
                                                    out_data);
 
+        // Only register 32f BGRA so Premiere's color pipeline automatically converts
+        // any 8u or YUV sequence to float4 before calling RenderCPU.
         (*pixelFormatSuite->ClearSupportedPixelFormats)(in_data->effect_ref);
         (*pixelFormatSuite->AddSupportedPixelFormat)(in_data->effect_ref, PrPixelFormat_BGRA_4444_32f);
-        (*pixelFormatSuite->AddSupportedPixelFormat)(in_data->effect_ref, PrPixelFormat_VUYA_4444_32f);
-        (*pixelFormatSuite->AddSupportedPixelFormat)(in_data->effect_ref, PrPixelFormat_BGRA_4444_8u);
-        (*pixelFormatSuite->AddSupportedPixelFormat)(in_data->effect_ref, PrPixelFormat_VUYA_4444_8u);
     }
 
     return PF_Err_NONE;
@@ -298,33 +333,20 @@ RenderCPU(
     // Get input and output pixel buffers
     PF_PixelFloat* inputData32f = reinterpret_cast<PF_PixelFloat*>(params[0]->u.ld.data);
     PF_PixelFloat* outputData32f = reinterpret_cast<PF_PixelFloat*>(output->data);
-    int rowPixels = output->rowbytes / sizeof(PF_PixelFloat);
+    int srcRowPixels = params[0]->u.ld.rowbytes / sizeof(PF_PixelFloat);
+    int dstRowPixels = output->rowbytes / sizeof(PF_PixelFloat);
+
+    // Stage input into a clean linear copy to prevent in-place read/write aliasing
+    std::vector<PF_PixelFloat> srcCopy(width * height);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            srcCopy[y * width + x] = inputData32f[y * srcRowPixels + x];
+        }
+    }
 
     float aspect = static_cast<float>(width) / static_cast<float>(height);
 
-    // Phase 0: Trivial Invert + Vignette mode when Mode == MODE_NONE
-    if (p.mode == MODE_NONE) {
-        float vigAmount = p.vignette * 0.01f;
-        for (int y = 0; y < height; ++y) {
-            for (int x = 0; x < width; ++x) {
-                float nx = (static_cast<float>(x) / static_cast<float>(width) - 0.5f) * 2.0f;
-                float ny = (static_cast<float>(y) / static_cast<float>(height) - 0.5f) * 2.0f;
-                float r2 = nx * nx + ny * ny;
-                float vig = 1.0f - (std::min)(1.0f, r2 * vigAmount * 0.5f);
-
-                PF_PixelFloat src = inputData32f[y * rowPixels + x];
-                PF_PixelFloat dst;
-                dst.red   = (1.0f - src.red) * vig;
-                dst.green = (1.0f - src.green) * vig;
-                dst.blue  = (1.0f - src.blue) * vig;
-                dst.alpha = src.alpha;
-                outputData32f[y * rowPixels + x] = dst;
-            }
-        }
-        return PF_Err_NONE;
-    }
-
-    // Phase 1: Smear Mode (CPU reference implementation with 1 LSB parity)
+    // Phase 1 & 2: Multi-Mode CPU Reference Pipeline
     float* historyIn = state->GetCurrentHistory();
     float* historyOut = state->GetNextHistory();
 
@@ -333,6 +355,7 @@ RenderCPU(
     float effPulse = p.pulse * 0.01f * effReact;
     float effLow   = p.driveLow * 0.01f * effReact;
     float effMid   = p.driveMid * 0.01f * effReact;
+    float effHigh  = p.driveHigh * 0.01f * effReact;
     float effChaos = (p.chaos * 0.01f) * (1.0f + effMid * 1.5f);
     float zoomPulse = effPulse * 0.25f + effLow * 0.10f;
     float twistRate = (p.twist * 0.01f) * 2.0f;
@@ -341,7 +364,7 @@ RenderCPU(
     float halfLife = 0.005f * powf(800.0f, decayNorm);
     float retention = expf(-0.693147f * dt / (std::max)(halfLife, 1e-4f));
     float trailMix = p.trails * 0.01f;
-    float injectGain = (p.inputGain * 0.01f) * 1.5f + effPulse * 0.8f;
+    float injectGain = (p.mode == MODE_NONE) ? 1.0f : ((p.inputGain * 0.01f) * 1.5f + effPulse * 0.8f);
     float exposure = powf(2.0f, (p.brightness - 50.0f) * 0.04f);
     float wet = p.dryWet * 0.01f;
 
@@ -352,7 +375,7 @@ RenderCPU(
     auto getLuma = [&](int cx, int cy) -> float {
         cx = (std::max)(0, (std::min)(width - 1, cx));
         cy = (std::max)(0, (std::min)(height - 1, cy));
-        PF_PixelFloat px = inputData32f[cy * rowPixels + cx];
+        PF_PixelFloat px = srcCopy[cy * width + cx];
         return 0.2126f * px.red + 0.7152f * px.green + 0.0722f * px.blue;
     };
 
@@ -374,14 +397,38 @@ RenderCPU(
         }
     }
 
-    // Advection + Feedback Pass
+    // Mode Shader + Advection + Feedback Pass
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
             float u = static_cast<float>(x) / static_cast<float>(width);
             float v = static_cast<float>(y) / static_cast<float>(height);
             float px = (u - 0.5f) * aspect * 2.0f;
             float py = (v - 0.5f) * 2.0f;
+
+            if (p.symmetry >= 1.0f) {
+                float sectors = floorf(p.symmetry);
+                float angle = atan2f(py, px);
+                float rad = sqrtf(px * px + py * py);
+                float sectorAngle = 6.2831853f / (std::max)(1.0f, sectors);
+                float a = fmodf(angle + 3.14159265f, sectorAngle);
+                if (a < 0.0f) a += sectorAngle;
+                a = fabsf(a - sectorAngle * 0.5f);
+                px = rad * cosf(a);
+                py = rad * sinf(a);
+            }
+
+            if (p.tiles >= 1.5f) {
+                float tCount = floorf(p.tiles);
+                float tu = Fract((px / (aspect * 2.0f) + 0.5f) * tCount);
+                float tv = Fract((py * 0.5f + 0.5f) * tCount);
+                px = (tu - 0.5f) * aspect * 2.0f;
+                py = (tv - 0.5f) * 2.0f;
+            }
+
             float r = sqrtf(px * px + py * py);
+            float theta = atan2f(py, px);
+            float warpedU = px / (aspect * 2.0f) + 0.5f;
+            float warpedV = py * 0.5f + 0.5f;
 
             float ncx = px * flowScale + startPhase * 0.13f;
             float ncy = py * flowScale - startPhase * 0.09f;
@@ -408,6 +455,60 @@ RenderCPU(
             float velX = vCurlX * effChaos * 0.5f + vEdgeX + radX * zoomPulse + swX * twistRate * (0.25f + r);
             float velY = vCurlY * effChaos * 0.5f + vEdgeY + radY * zoomPulse + swY * twistRate * (0.25f + r);
 
+            PF_PixelFloat rawDry = srcCopy[y * width + x];
+            PF_PixelFloat fresh = rawDry;
+            bool useFeedback = (p.mode == MODE_SMEAR || p.mode == MODE_MELT || p.mode == MODE_MOSH);
+
+            if (p.mode == MODE_NONE) {
+                fresh = SampleBilinear_CPU(srcCopy, width, height, warpedU, warpedV);
+            } else if (p.mode == MODE_SMEAR) {
+                float heatScale = (p.heat * 0.01f) * (1.0f + effLow * 0.5f);
+                float refrU = warpedU + vCurlX * heatScale * 0.008f;
+                float refrV = warpedV + vCurlY * heatScale * 0.008f;
+                int su = (std::max)(0, (std::min)(width - 1, static_cast<int>(refrU * width)));
+                int sv = (std::max)(0, (std::min)(height - 1, static_cast<int>(refrV * height)));
+                fresh = srcCopy[sv * width + su];
+            } else if (p.mode == MODE_DROSTE) {
+                float safeR = (std::max)(r, 1e-4f);
+                float branches = (std::max)(1.0f, floorf(1.0f + (p.complexity * 0.01f) * 3.0f));
+                float spiralAngle = theta + (1.2f + (p.shape * 0.01f) * 1.5f) * logf(safeR) + twistRate - startPhase * 1.4f;
+                float du = Fract((spiralAngle / 6.2831853f) * branches);
+                float dv = Fract(0.65f * logf(safeR) - startPhase * 0.45f - effPulse * 0.2f);
+                fresh = SampleBilinear_CPU(srcCopy, width, height, du, dv);
+            } else if (p.mode == MODE_CORRIDOR || p.mode == MODE_INFINITE || p.mode == MODE_CUBE) {
+                float safeR = (std::max)(r, 1e-3f);
+                float depth = -1.3f * logf(safeR) + 0.15f / safeR;
+                float rep = (std::max)(1.0f, floorf(1.0f + (p.complexity * 0.01f) * 3.0f));
+                float tu = Fract(((theta + twistRate * 0.35f * depth + startPhase * 0.25f) / 6.2831853f) * rep);
+                float tv = Fract(depth * 0.35f - startPhase * 0.85f - effPulse * 0.25f);
+                fresh = SampleBilinear_CPU(srcCopy, width, height, tu, tv);
+            } else if (p.mode == MODE_PRISM) {
+                float disp = (0.015f + (p.heat * 0.01f) * 0.06f + effHigh * 0.05f) * (1.0f + effChaos);
+                PF_PixelFloat cB = SampleBilinear_CPU(srcCopy, width, height, warpedU - vCurlX * disp, warpedV - vCurlY * disp);
+                PF_PixelFloat cG = SampleBilinear_CPU(srcCopy, width, height, warpedU, warpedV);
+                PF_PixelFloat cR = SampleBilinear_CPU(srcCopy, width, height, warpedU + vCurlX * disp, warpedV + vCurlY * disp);
+                fresh.blue = cB.blue; fresh.green = cG.green; fresh.red = cR.red; fresh.alpha = cG.alpha;
+            } else if (p.mode == MODE_HALFTONE) {
+                float gridDensity = 24.0f + (p.complexity * 0.01f) * 96.0f;
+                float rx = px * gridDensity * 0.5f;
+                float ry = py * gridDensity * 0.5f;
+                float cx_i = floorf(rx) + 0.5f;
+                float cy_i = floorf(ry) + 0.5f;
+                float lx = rx - cx_i;
+                float ly = ry - cy_i;
+                float cU = (cx_i / (gridDensity * 0.5f)) / (aspect * 2.0f) + 0.5f;
+                float cV = (cy_i / (gridDensity * 0.5f)) * 0.5f + 0.5f;
+                PF_PixelFloat cCol = SampleBilinear_CPU(srcCopy, width, height, cU, cV);
+                float luma = 0.2126f * cCol.red + 0.7152f * cCol.green + 0.0722f * cCol.blue;
+                float dotRad = 0.52f * sqrtf((std::max)(0.0f, luma)) * (0.75f + 0.45f * (p.contrast * 0.01f));
+                float dist = sqrtf(lx * lx + ly * ly);
+                float mult = dist <= dotRad ? 1.0f : (p.fill * 0.01f) * 0.25f;
+                fresh.red = cCol.red * mult; fresh.green = cCol.green * mult; fresh.blue = cCol.blue * mult; fresh.alpha = cCol.alpha;
+            } else {
+                fresh = SampleBilinear_CPU(srcCopy, width, height, warpedU, warpedV);
+                useFeedback = true;
+            }
+
             float backPx = px - velX * dt * 2.0f;
             float backPy = py - velY * dt * 2.0f;
             float backU = backPx / (aspect * 2.0f) + 0.5f;
@@ -431,23 +532,17 @@ RenderCPU(
             float advectedG = (1.0f - fx) * (1.0f - fy) * historyIn[idx00 + 1] + fx * (1.0f - fy) * historyIn[idx10 + 1] + (1.0f - fx) * fy * historyIn[idx01 + 1] + fx * fy * historyIn[idx11 + 1];
             float advectedB = (1.0f - fx) * (1.0f - fy) * historyIn[idx00 + 2] + fx * (1.0f - fy) * historyIn[idx10 + 2] + (1.0f - fx) * fy * historyIn[idx01 + 2] + fx * fy * historyIn[idx11 + 2];
 
-            float heatScale = (p.heat * 0.01f) * (1.0f + effLow * 0.5f);
-            float refrU = u + vCurlX * heatScale * 0.008f;
-            float refrV = v + vCurlY * heatScale * 0.008f;
-            int su = (std::max)(0, (std::min)(width - 1, static_cast<int>(refrU * width)));
-            int sv = (std::max)(0, (std::min)(height - 1, static_cast<int>(refrV * height)));
-
-            PF_PixelFloat fresh = inputData32f[sv * rowPixels + su];
             float freshR = fresh.red * injectGain;
             float freshG = fresh.green * injectGain;
             float freshB = fresh.blue * injectGain;
 
-            float feedR = (std::max)(freshR, advectedR * retention * trailMix);
-            float feedG = (std::max)(freshG, advectedG * retention * trailMix);
-            float feedB = (std::max)(freshB, advectedB * retention * trailMix);
+            float effTrail = useFeedback ? trailMix : 0.0f;
+            float feedR = (std::max)(freshR, advectedR * retention * effTrail);
+            float feedG = (std::max)(freshG, advectedG * retention * effTrail);
+            float feedB = (std::max)(freshB, advectedB * retention * effTrail);
 
             float maxCh = (std::max)(feedR, (std::max)(feedG, feedB));
-            if (maxCh > 0.65f) {
+            if (useFeedback && maxCh > 0.65f) {
                 float bloom = powf(maxCh - 0.65f, 1.1f) * (2.2f + (p.heat * 0.01f) * 4.0f);
                 feedR += bloom;
                 feedG += bloom;
@@ -460,9 +555,9 @@ RenderCPU(
             historyOut[outIdx + 2] = feedB;
             historyOut[outIdx + 3] = 1.0f;
 
-            float toneR = 1.0f - expf(-feedR * exposure);
-            float toneG = 1.0f - expf(-feedG * exposure);
-            float toneB = 1.0f - expf(-feedB * exposure);
+            float toneR = (p.mode == MODE_NONE) ? feedR : (1.0f - expf(-feedR * exposure));
+            float toneG = (p.mode == MODE_NONE) ? feedG : (1.0f - expf(-feedG * exposure));
+            float toneB = (p.mode == MODE_NONE) ? feedB : (1.0f - expf(-feedB * exposure));
 
             if (p.vignette > 0.0f) {
                 float vig = 1.0f - (std::min)(1.0f, (r * r) * (p.vignette * 0.01f));
@@ -470,11 +565,11 @@ RenderCPU(
             }
 
             PF_PixelFloat dst;
-            dst.red   = fresh.red * (1.0f - wet) + toneR * wet;
-            dst.green = fresh.green * (1.0f - wet) + toneG * wet;
-            dst.blue  = fresh.blue * (1.0f - wet) + toneB * wet;
-            dst.alpha = fresh.alpha;
-            outputData32f[y * rowPixels + x] = dst;
+            dst.red   = rawDry.red * (1.0f - wet) + toneR * wet;
+            dst.green = rawDry.green * (1.0f - wet) + toneG * wet;
+            dst.blue  = rawDry.blue * (1.0f - wet) + toneB * wet;
+            dst.alpha = rawDry.alpha;
+            outputData32f[y * dstRowPixels + x] = dst;
         }
     }
 

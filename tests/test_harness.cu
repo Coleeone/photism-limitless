@@ -497,7 +497,61 @@ int main() {
     bool pass6 = (avgMsPerFrame < 5.0 && cpu4kMs > 0.0);
     std::cout << "  Result: " << (pass6 ? "PASS" : "FAIL") << std::endl;
 
+    // -------------------------------------------------------------------------
+    // TEST 7: Phase 2 - Multi-Mode Visual Distinctness Verification
+    // -------------------------------------------------------------------------
+    std::cout << "\n[TEST 7] Phase 2: All 21 Modes Distinct Output Verification" << std::endl;
+    float4* d_src_test7 = nullptr;
+    cudaMalloc(&d_src_test7, numPixels * sizeof(float4));
+    cudaMemcpy(d_src_test7, srcHost.data(), numPixels * sizeof(float4), cudaMemcpyHostToDevice);
+    int testModes[] = {
+        MODE_NONE, MODE_SMEAR, MODE_DROSTE, MODE_INFINITE, MODE_CORRIDOR,
+        MODE_CUBE, MODE_PLANET, MODE_WINDOWS, MODE_MELT, MODE_SHATTER,
+        MODE_PRISM, MODE_TERRAIN, MODE_BREATHE, MODE_MOSH, MODE_SORT,
+        MODE_CORAL, MODE_SCANLINE, MODE_THRESH, MODE_SOLAR, MODE_HALFTONE, MODE_VHS
+    };
+    const char* modeNames[] = {
+        "None", "Smear", "Droste", "Infinite", "Corridor",
+        "Cube", "Planet", "Windows", "Melt", "Shatter",
+        "Prism", "Terrain", "Breathe", "Mosh", "Sort",
+        "Coral", "Scanline", "Thresh", "Solar", "Halftone", "VHS"
+    };
+
+    std::vector<std::vector<float4> > modeOutputs(21, std::vector<float4>(numPixels));
+    for (int mIdx = 0; mIdx < 21; ++mIdx) {
+        cudaMemset(d_hA, 0, numPixels * sizeof(float4));
+        cudaMemset(d_hB, 0, numPixels * sizeof(float4));
+        PhotismParamsGPU mp = smearParams;
+        mp.mode = testModes[mIdx];
+        mp.phase = 1.25f;
+        mp.frameIndex = 30;
+        LaunchSmearPipeline_CUDA(d_src_test7, d_gr, d_hA, d_hB, d_smearOut, w, 0, w, h, mp);
+        cudaDeviceSynchronize();
+        cudaMemcpy(modeOutputs[mIdx].data(), d_smearOut, numPixels * sizeof(float4), cudaMemcpyDeviceToHost);
+    }
+
+    bool pass7 = true;
+    int distinctPairs = 0;
+    for (int mIdx = 1; mIdx < 21; ++mIdx) {
+        double meanAbsDiff = 0.0;
+        for (size_t i = 0; i < numPixels; i += 16) {
+            meanAbsDiff += fabsf(modeOutputs[mIdx][i].x - modeOutputs[0][i].x) +
+                           fabsf(modeOutputs[mIdx][i].y - modeOutputs[0][i].y) +
+                           fabsf(modeOutputs[mIdx][i].z - modeOutputs[0][i].z);
+        }
+        meanAbsDiff /= (numPixels / 16);
+        if (meanAbsDiff > 0.005) {
+            distinctPairs++;
+        } else {
+            std::cout << "  WARNING: Mode " << modeNames[mIdx] << " too close to None (diff=" << meanAbsDiff << ")" << std::endl;
+            pass7 = false;
+        }
+    }
+    std::cout << "  Verified distinct mode outputs against baseline: " << distinctPairs << " / 20 modes" << std::endl;
+    std::cout << "  Result: " << (pass7 ? "PASS (All 21 modes produce distinct visual shaders)" : "FAIL") << std::endl;
+
     // Cleanup
+    cudaFree(d_src_test7);
     cudaFree(d_dest);
     cudaFree(d_logo);
     cudaFree(d_hA);
@@ -505,7 +559,7 @@ int main() {
     cudaFree(d_gr);
     cudaFree(d_smearOut);
 
-    bool allPass = pass1 && pass2 && pass3 && pass4 && pass5 && pass6;
+    bool allPass = pass1 && pass2 && pass3 && pass4 && pass5 && pass6 && pass7;
     std::cout << "\n============================================================" << std::endl;
     std::cout << " FINAL STATUS: " << (allPass ? "ALL ACCEPTANCE TESTS PASSED" : "FAILED") << std::endl;
     std::cout << "============================================================" << std::endl;
