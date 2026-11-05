@@ -28,7 +28,8 @@ extern "C" void LaunchSmearPipeline_CUDA(
     int is16f,
     int width,
     int height,
-    PhotismParamsGPU params);
+    PhotismParamsGPU params,
+    cudaStream_t stream = 0);
 
 // CPU equivalents for parity testing
 void RunTrivialCPU(float4* dest, int width, int height, float vigAmount) {

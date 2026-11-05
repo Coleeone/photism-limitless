@@ -951,15 +951,16 @@ extern "C" void LaunchSmearPipeline_CUDA(
     int is16f,
     int width,
     int height,
-    PhotismParamsGPU params)
+    PhotismParamsGPU params,
+    cudaStream_t stream)
 {
     dim3 threads(16, 16);
     dim3 grid((width + threads.x - 1) / threads.x,
               (height + threads.y - 1) / threads.y);
 
     int sPitch = params.srcPitch > 0 ? params.srcPitch : destPitch;
-    kSmear_PrepassSobel<<<grid, threads>>>(srcImg, gradBuffer, sPitch, is16f, width, height);
+    kSmear_PrepassSobel<<<grid, threads, 0, stream>>>(srcImg, gradBuffer, sPitch, is16f, width, height);
 
-    kSmear_AdvectFeedback<<<grid, threads>>>(srcImg, gradBuffer, historyIn, historyOut, destImg,
-                                             destPitch, is16f, width, height, params);
+    kSmear_AdvectFeedback<<<grid, threads, 0, stream>>>(srcImg, gradBuffer, historyIn, historyOut, destImg,
+                                                        destPitch, is16f, width, height, params);
 }

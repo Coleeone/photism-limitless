@@ -35,7 +35,8 @@ extern "C" void LaunchSmearPipeline_CUDA(
     int is16f,
     int width,
     int height,
-    PhotismParamsGPU params);
+    PhotismParamsGPU params,
+    cudaStream_t stream = 0);
 #endif
 
 // OpenCL Source Inclusion
@@ -57,10 +58,12 @@ public:
 
     virtual ~PhotismLimitlessGPU() {
 #if HAS_CUDA
-        if (mCudaHistoryA) cudaFree(mCudaHistoryA);
-        if (mCudaHistoryB) cudaFree(mCudaHistoryB);
-        if (mCudaGradBuffer) cudaFree(mCudaGradBuffer);
-        if (mCudaSrcCopy) cudaFree(mCudaSrcCopy);
+        if (mGPUDeviceSuite) {
+            if (mCudaHistoryA) mGPUDeviceSuite->FreeDeviceMemory(mDeviceIndex, mCudaHistoryA);
+            if (mCudaHistoryB) mGPUDeviceSuite->FreeDeviceMemory(mDeviceIndex, mCudaHistoryB);
+            if (mCudaGradBuffer) mGPUDeviceSuite->FreeDeviceMemory(mDeviceIndex, mCudaGradBuffer);
+            if (mCudaSrcCopy) mGPUDeviceSuite->FreeDeviceMemory(mDeviceIndex, mCudaSrcCopy);
+        }
 #endif
 #if HAS_OPENCL
         if (mClHistoryA) clReleaseMemObject(mClHistoryA);
@@ -214,21 +217,29 @@ public:
         // Dispatch to Hardware Framework
         if (mDeviceInfo.outDeviceFramework == PrGPUDeviceFramework_CUDA) {
 #if HAS_CUDA
-            EnsureCUDABuffers(width, height, state);
+            // Clear any prior sticky/non-sticky error on this thread before doing work
+            cudaGetLastError();
 
-            if (seekOccurred) {
-                cudaMemcpy(mCudaHistoryA, state->GetCurrentHistory(), width * height * sizeof(float4), cudaMemcpyHostToDevice);
+            if (!EnsureCUDABuffers(width, height, state)) {
+                return suiteError_Fail;
             }
 
-            // Stage source frame into mCudaSrcCopy to eliminate in-place read/write race conditions
-            cudaMemcpy2D(
+            cudaStream_t stream = reinterpret_cast<cudaStream_t>(mDeviceInfo.outCommandQueueHandle);
+
+            if (seekOccurred && (params.mode == MODE_SMEAR || params.mode == MODE_MELT || params.mode == MODE_MOSH)) {
+                cudaMemcpyAsync(mCudaHistoryA, state->GetCurrentHistory(), width * height * sizeof(float4), cudaMemcpyHostToDevice, stream);
+            }
+
+            // Stage source frame into mCudaSrcCopy on Premiere's active CUDA stream
+            cudaMemcpy2DAsync(
                 mCudaSrcCopy,
                 static_cast<size_t>(width) * bytesPerPx,
                 rawSrcData,
                 static_cast<size_t>(srcRowBytes),
                 static_cast<size_t>(width) * bytesPerPx,
                 static_cast<size_t>(height),
-                cudaMemcpyDeviceToDevice);
+                cudaMemcpyDeviceToDevice,
+                stream);
 
             float4* destCUDA = reinterpret_cast<float4*>(destFrameData);
             const float4* srcCUDA = reinterpret_cast<const float4*>(mCudaSrcCopy);
@@ -243,7 +254,8 @@ public:
                 is16f,
                 width,
                 height,
-                params
+                params,
+                stream
             );
 
             // Ping-pong buffer swap
@@ -251,14 +263,11 @@ public:
             mCudaHistoryA = mCudaHistoryB;
             mCudaHistoryB = tmp;
 
-            if (params.frameIndex % 10 == 0) {
-                cudaMemcpy(state->GetCurrentHistory(), mCudaHistoryA, width * height * sizeof(float4), cudaMemcpyDeviceToHost);
-                state->CommitStep(params.frameIndex, params.phase, state->GetCurrentHistory());
-            } else {
-                state->CommitStep(params.frameIndex, params.phase, nullptr);
-            }
+            // Commit lightweight phase & frame index without blocking GPU-to-Host DMA during render/export
+            state->CommitStep(params.frameIndex, params.phase, nullptr);
 
-            if (cudaPeekAtLastError() != cudaSuccess) return suiteError_Fail;
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess) return suiteError_Fail;
             return suiteError_NoError;
 #else
             return suiteError_NotImplemented;
@@ -326,25 +335,28 @@ public:
 
 private:
 #if HAS_CUDA
-    void EnsureCUDABuffers(int width, int height, std::shared_ptr<InstanceSimulationState>& state) {
+    bool EnsureCUDABuffers(int width, int height, std::shared_ptr<InstanceSimulationState>& state) {
         size_t totalPixels = static_cast<size_t>(width) * height;
         if (totalPixels != mAllocatedPixels) {
-            if (mCudaHistoryA) cudaFree(mCudaHistoryA);
-            if (mCudaHistoryB) cudaFree(mCudaHistoryB);
-            if (mCudaGradBuffer) cudaFree(mCudaGradBuffer);
-            if (mCudaSrcCopy) cudaFree(mCudaSrcCopy);
+            if (mCudaHistoryA) { mGPUDeviceSuite->FreeDeviceMemory(mDeviceIndex, mCudaHistoryA); mCudaHistoryA = nullptr; }
+            if (mCudaHistoryB) { mGPUDeviceSuite->FreeDeviceMemory(mDeviceIndex, mCudaHistoryB); mCudaHistoryB = nullptr; }
+            if (mCudaGradBuffer) { mGPUDeviceSuite->FreeDeviceMemory(mDeviceIndex, mCudaGradBuffer); mCudaGradBuffer = nullptr; }
+            if (mCudaSrcCopy) { mGPUDeviceSuite->FreeDeviceMemory(mDeviceIndex, mCudaSrcCopy); mCudaSrcCopy = nullptr; }
 
-            cudaMalloc(&mCudaHistoryA, totalPixels * sizeof(float4));
-            cudaMalloc(&mCudaHistoryB, totalPixels * sizeof(float4));
-            cudaMalloc(&mCudaGradBuffer, totalPixels * sizeof(float2));
-            cudaMalloc(&mCudaSrcCopy, totalPixels * sizeof(float4));
-            cudaMemset(mCudaHistoryA, 0, totalPixels * sizeof(float4));
-            cudaMemset(mCudaHistoryB, 0, totalPixels * sizeof(float4));
-            cudaMemset(mCudaSrcCopy, 0, totalPixels * sizeof(float4));
+            if (mGPUDeviceSuite->AllocateDeviceMemory(mDeviceIndex, totalPixels * sizeof(float4), &mCudaHistoryA) != suiteError_NoError) return false;
+            if (mGPUDeviceSuite->AllocateDeviceMemory(mDeviceIndex, totalPixels * sizeof(float4), &mCudaHistoryB) != suiteError_NoError) return false;
+            if (mGPUDeviceSuite->AllocateDeviceMemory(mDeviceIndex, totalPixels * sizeof(float2), &mCudaGradBuffer) != suiteError_NoError) return false;
+            if (mGPUDeviceSuite->AllocateDeviceMemory(mDeviceIndex, totalPixels * sizeof(float4), &mCudaSrcCopy) != suiteError_NoError) return false;
+
+            cudaStream_t stream = reinterpret_cast<cudaStream_t>(mDeviceInfo.outCommandQueueHandle);
+            cudaMemsetAsync(mCudaHistoryA, 0, totalPixels * sizeof(float4), stream);
+            cudaMemsetAsync(mCudaHistoryB, 0, totalPixels * sizeof(float4), stream);
+            cudaMemsetAsync(mCudaSrcCopy, 0, totalPixels * sizeof(float4), stream);
             mAllocatedPixels = totalPixels;
 
             if (state) state->Allocate(width, height);
         }
+        return (mCudaHistoryA && mCudaHistoryB && mCudaGradBuffer && mCudaSrcCopy);
     }
 #endif
 

@@ -116,8 +116,7 @@ GlobalSetup(
                            PF_OutFlag_USE_OUTPUT_EXTENT |
                            PF_OutFlag_NON_PARAM_VARY;
 
-    out_data->out_flags2 = PF_OutFlag2_SUPPORTS_SMART_RENDER |
-                           PF_OutFlag2_FLOAT_COLOR_AWARE |
+    out_data->out_flags2 = PF_OutFlag2_FLOAT_COLOR_AWARE |
                            PF_OutFlag2_DOESNT_NEED_EMPTY_PIXELS;
 
     if (in_data->appl_id == 'PrMr') {
@@ -127,10 +126,13 @@ GlobalSetup(
                                                    kPFPixelFormatSuiteVersion1,
                                                    out_data);
 
-        // Only register 32f BGRA so Premiere's color pipeline automatically converts
-        // any 8u or YUV sequence to float4 before calling RenderCPU.
+        // Register all standard Premiere pixel formats so both GPU-fallback and
+        // QuickTime/YUV Render In-to-Out previews succeed without format rejections.
         (*pixelFormatSuite->ClearSupportedPixelFormats)(in_data->effect_ref);
         (*pixelFormatSuite->AddSupportedPixelFormat)(in_data->effect_ref, PrPixelFormat_BGRA_4444_32f);
+        (*pixelFormatSuite->AddSupportedPixelFormat)(in_data->effect_ref, PrPixelFormat_VUYA_4444_32f);
+        (*pixelFormatSuite->AddSupportedPixelFormat)(in_data->effect_ref, PrPixelFormat_BGRA_4444_8u);
+        (*pixelFormatSuite->AddSupportedPixelFormat)(in_data->effect_ref, PrPixelFormat_VUYA_4444_8u);
     }
 
     return PF_Err_NONE;
@@ -330,17 +332,56 @@ RenderCPU(
     float speedRate = (p.speed * 0.01f) * (1.0f + (p.react * 0.01f) * (p.driveMid * 0.01f));
     bool needResim = state->CheckSeekAndPrepare(frameIndex, dt, speedRate, startFrame, startPhase);
 
-    // Get input and output pixel buffers
-    PF_PixelFloat* inputData32f = reinterpret_cast<PF_PixelFloat*>(params[0]->u.ld.data);
-    PF_PixelFloat* outputData32f = reinterpret_cast<PF_PixelFloat*>(output->data);
-    int srcRowPixels = params[0]->u.ld.rowbytes / sizeof(PF_PixelFloat);
-    int dstRowPixels = output->rowbytes / sizeof(PF_PixelFloat);
+    // Query actual pixel format from Premiere Pro so 8-bit, 32-bit, BGRA, and VUYA sequences
+    // all decode and encode cleanly during Render In-to-Out (QuickTime preview) and Media Encoder exports.
+    PrPixelFormat destFormat = PrPixelFormat_BGRA_4444_32f;
+    if (in_data->appl_id == 'PrMr') {
+        AEFX_SuiteScoper<PF_PixelFormatSuite1> pixelFormatSuite(
+            in_data, kPFPixelFormatSuite, kPFPixelFormatSuiteVersion1, out_data);
+        pixelFormatSuite->GetPixelFormat(output, &destFormat);
+    }
 
-    // Stage input into a clean linear copy to prevent in-place read/write aliasing
+    const uint8_t* rawSrcBase = reinterpret_cast<const uint8_t*>(params[0]->u.ld.data);
+    uint8_t* rawDstBase = reinterpret_cast<uint8_t*>(output->data);
+    int srcRowBytes = params[0]->u.ld.rowbytes;
+    int dstRowBytes = output->rowbytes;
+
+    // Stage input into a clean linear RGBA32F copy (converting from 8u / VUYA if needed)
     std::vector<PF_PixelFloat> srcCopy(width * height);
     for (int y = 0; y < height; ++y) {
+        const uint8_t* srcRow = rawSrcBase + y * srcRowBytes;
         for (int x = 0; x < width; ++x) {
-            srcCopy[y * width + x] = inputData32f[y * srcRowPixels + x];
+            PF_PixelFloat px = {};
+            if (destFormat == PrPixelFormat_BGRA_4444_8u) {
+                const uint8_t* p8 = srcRow + x * 4;
+                px.blue  = p8[0] / 255.0f;
+                px.green = p8[1] / 255.0f;
+                px.red   = p8[2] / 255.0f;
+                px.alpha = p8[3] / 255.0f;
+            } else if (destFormat == PrPixelFormat_VUYA_4444_8u) {
+                const uint8_t* p8 = srcRow + x * 4;
+                float v_val = (static_cast<float>(p8[0]) - 128.0f) / 255.0f;
+                float u_val = (static_cast<float>(p8[1]) - 128.0f) / 255.0f;
+                float y_val = static_cast<float>(p8[2]) / 255.0f;
+                px.red   = (std::max)(0.0f, (std::min)(1.0f, y_val + 1.402f * v_val));
+                px.green = (std::max)(0.0f, (std::min)(1.0f, y_val - 0.344136f * u_val - 0.714136f * v_val));
+                px.blue  = (std::max)(0.0f, (std::min)(1.0f, y_val + 1.772f * u_val));
+                px.alpha = p8[3] / 255.0f;
+            } else if (destFormat == PrPixelFormat_VUYA_4444_32f) {
+                const float* pf = reinterpret_cast<const float*>(srcRow) + x * 4;
+                float v_val = pf[0];
+                float u_val = pf[1];
+                float y_val = pf[2];
+                px.red   = y_val + 1.402f * v_val;
+                px.green = y_val - 0.344136f * u_val - 0.714136f * v_val;
+                px.blue  = y_val + 1.772f * u_val;
+                px.alpha = pf[3];
+            } else {
+                // PrPixelFormat_BGRA_4444_32f (default)
+                const PF_PixelFloat* pf = reinterpret_cast<const PF_PixelFloat*>(srcRow);
+                px = pf[x];
+            }
+            srcCopy[y * width + x] = px;
         }
     }
 
@@ -569,7 +610,33 @@ RenderCPU(
             dst.green = rawDry.green * (1.0f - wet) + toneG * wet;
             dst.blue  = rawDry.blue * (1.0f - wet) + toneB * wet;
             dst.alpha = rawDry.alpha;
-            outputData32f[y * dstRowPixels + x] = dst;
+
+            uint8_t* dstRow = rawDstBase + y * dstRowBytes;
+            if (destFormat == PrPixelFormat_BGRA_4444_8u) {
+                uint8_t* p8 = dstRow + x * 4;
+                p8[0] = static_cast<uint8_t>((std::max)(0.0f, (std::min)(255.0f, dst.blue * 255.0f + 0.5f)));
+                p8[1] = static_cast<uint8_t>((std::max)(0.0f, (std::min)(255.0f, dst.green * 255.0f + 0.5f)));
+                p8[2] = static_cast<uint8_t>((std::max)(0.0f, (std::min)(255.0f, dst.red * 255.0f + 0.5f)));
+                p8[3] = static_cast<uint8_t>((std::max)(0.0f, (std::min)(255.0f, dst.alpha * 255.0f + 0.5f)));
+            } else if (destFormat == PrPixelFormat_VUYA_4444_8u) {
+                uint8_t* p8 = dstRow + x * 4;
+                float y_val = 0.299f * dst.red + 0.587f * dst.green + 0.114f * dst.blue;
+                float u_val = -0.168736f * dst.red - 0.331264f * dst.green + 0.5f * dst.blue;
+                float v_val = 0.5f * dst.red - 0.418688f * dst.green - 0.081312f * dst.blue;
+                p8[0] = static_cast<uint8_t>((std::max)(0.0f, (std::min)(255.0f, (v_val * 255.0f) + 128.0f + 0.5f)));
+                p8[1] = static_cast<uint8_t>((std::max)(0.0f, (std::min)(255.0f, (u_val * 255.0f) + 128.0f + 0.5f)));
+                p8[2] = static_cast<uint8_t>((std::max)(0.0f, (std::min)(255.0f, y_val * 255.0f + 0.5f)));
+                p8[3] = static_cast<uint8_t>((std::max)(0.0f, (std::min)(255.0f, dst.alpha * 255.0f + 0.5f)));
+            } else if (destFormat == PrPixelFormat_VUYA_4444_32f) {
+                float* pf = reinterpret_cast<float*>(dstRow) + x * 4;
+                pf[0] = 0.5f * dst.red - 0.418688f * dst.green - 0.081312f * dst.blue;
+                pf[1] = -0.168736f * dst.red - 0.331264f * dst.green + 0.5f * dst.blue;
+                pf[2] = 0.299f * dst.red + 0.587f * dst.green + 0.114f * dst.blue;
+                pf[3] = dst.alpha;
+            } else {
+                PF_PixelFloat* pf = reinterpret_cast<PF_PixelFloat*>(dstRow);
+                pf[x] = dst;
+            }
         }
     }
 

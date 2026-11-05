@@ -37,7 +37,7 @@ resource 'PiPL' (16000) {
             0x00000440
         },
         AE_Effect_Global_OutFlags_2 {
-            0x00001440
+            0x00001040
         },
         AE_Effect_Match_Name {
             "Photism Limitless"
