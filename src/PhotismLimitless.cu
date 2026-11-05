@@ -267,10 +267,12 @@ __global__ void kSmear_AdvectFeedback(
 
     // Effective Audio & Tune Modifiers
     float effReact = params.react * 0.01f;
-    float effPulse = params.pulse * 0.01f * effReact;
-    float effLow   = params.driveLow * 0.01f * effReact;
-    float effMid   = params.driveMid * 0.01f * effReact;
-    float effHigh  = params.driveHigh * 0.01f * effReact;
+    // Drive/Pulse sliders always have a baseline effect; React amplifies them (React=0 no longer mutes them)
+    float driveGain = 0.35f + effReact;
+    float effPulse = params.pulse * 0.01f * driveGain;
+    float effLow   = params.driveLow * 0.01f * driveGain;
+    float effMid   = params.driveMid * 0.01f * driveGain;
+    float effHigh  = params.driveHigh * 0.01f * driveGain;
     float effChaos = (params.chaos * 0.01f) * (1.0f + effMid * 1.5f);
     float dt = params.dt > 0.0f ? params.dt : 0.01667f;
 
@@ -330,6 +332,17 @@ __global__ void kSmear_AdvectFeedback(
             p.x += cell.x * lensAmt * 2.5f;
             p.y += cell.y * lensAmt * 2.5f;
         }
+    }
+
+    // Global Twist for modes whose geometry does not already consume twistRate
+    if (params.twist > 0.0f && params.mode != MODE_DROSTE && params.mode != MODE_INFINITE &&
+        params.mode != MODE_CORRIDOR && params.mode != MODE_PLANET && params.mode != MODE_SMEAR) {
+        float rr = sqrtf(p.x * p.x + p.y * p.y);
+        float ang = (params.twist * 0.01f) * 2.5f * fmaxf(0.0f, 1.4f - rr) + effHigh * 0.15f;
+        float ca = cosf(ang), sa = sinf(ang);
+        float nx = p.x * ca - p.y * sa;
+        float ny = p.x * sa + p.y * ca;
+        p.x = nx; p.y = ny;
     }
 
     float r = sqrtf(p.x * p.x + p.y * p.y);
@@ -869,6 +882,17 @@ __global__ void kSmear_AdvectFeedback(
     } else {
         float gain = (params.mode == MODE_NONE) ? 1.0f : ((params.inputGain * 0.01f) * 1.25f + effPulse * 0.5f);
         feedback = make_float4(modeColor.x * gain, modeColor.y * gain, modeColor.z * gain, 1.0f);
+        // Echo trails for geometric modes: Trails & Decay are live in every mode (not just Smear/Melt/Mosh)
+        if (params.mode != MODE_NONE && params.trails > 0.0f) {
+            float decayNormE = params.decay * 0.01f;
+            float halfLifeE = 0.005f * powf(800.0f, decayNormE);
+            float retentionE = expf(-0.693147f * dt / halfLifeE);
+            float mixE = (params.trails * 0.01f) * modeTrailScale * 0.85f * retentionE;
+            float4 h = historyIn[y * width + x];
+            feedback.x = fmaxf(feedback.x, h.x * mixE);
+            feedback.y = fmaxf(feedback.y, h.y * mixE);
+            feedback.z = fmaxf(feedback.z, h.z * mixE);
+        }
     }
 
     historyOut[y * width + x] = feedback;
@@ -907,6 +931,17 @@ __global__ void kSmear_AdvectFeedback(
         tonemapped.x *= vig;
         tonemapped.y *= vig;
         tonemapped.z *= vig;
+    }
+
+    // Global Contrast: S-curve punch (0 = flat/linear, 100 = strong)
+    if (params.contrast > 0.0f) {
+        float cAmt = params.contrast * 0.006f;
+        float cx = fminf(1.0f, fmaxf(0.0f, tonemapped.x));
+        float cy = fminf(1.0f, fmaxf(0.0f, tonemapped.y));
+        float cz = fminf(1.0f, fmaxf(0.0f, tonemapped.z));
+        tonemapped.x = cx + (cx * cx * (3.0f - 2.0f * cx) - cx) * cAmt;
+        tonemapped.y = cy + (cy * cy * (3.0f - 2.0f * cy) - cy) * cAmt;
+        tonemapped.z = cz + (cz * cz * (3.0f - 2.0f * cz) - cz) * cAmt;
     }
 
     float wet = params.dryWet * 0.01f;

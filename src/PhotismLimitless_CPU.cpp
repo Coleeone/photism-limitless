@@ -395,10 +395,11 @@ RenderCPU(
 
     float flowScale = 1.5f + (p.complexity * 0.01f) * 2.5f;
     float effReact = p.react * 0.01f;
-    float effPulse = p.pulse * 0.01f * effReact;
-    float effLow   = p.driveLow * 0.01f * effReact;
-    float effMid   = p.driveMid * 0.01f * effReact;
-    float effHigh  = p.driveHigh * 0.01f * effReact;
+    float driveGain = 0.35f + effReact; // matches GPU: React amplifies drives, never mutes them
+    float effPulse = p.pulse * 0.01f * driveGain;
+    float effLow   = p.driveLow * 0.01f * driveGain;
+    float effMid   = p.driveMid * 0.01f * driveGain;
+    float effHigh  = p.driveHigh * 0.01f * driveGain;
     float effChaos = (p.chaos * 0.01f) * (1.0f + effMid * 1.5f);
     float zoomPulse = effPulse * 0.25f + effLow * 0.10f;
     float twistRate = (p.twist * 0.01f) * 2.0f;
@@ -466,6 +467,51 @@ RenderCPU(
                 float tv = Fract((py * 0.5f + 0.5f) * tCount);
                 px = (tu - 0.5f) * aspect * 2.0f;
                 py = (tv - 0.5f) * 2.0f;
+            }
+
+            if (p.slice > 0.0f) {
+                float sliceAmt = (p.slice * 0.01f) * (0.08f + effPulse * 0.15f);
+                float band = floorf((py * 0.5f + 0.5f) * (12.0f + p.complexity * 0.2f));
+                float shift = (Hash21_CPU(band, floorf(startPhase * 4.0f)) - 0.5f) * 2.0f;
+                px += shift * sliceAmt * aspect;
+            }
+
+            if (p.lens > 0.0f) {
+                float lensAmt = (p.lens * 0.01f) * 0.18f;
+                float ribs = 16.0f + (p.complexity * 0.35f);
+                if (p.lensStyle == LENS_GLASS_RIBS) {
+                    px += sinf(px * ribs + startPhase) * lensAmt;
+                } else if (p.lensStyle == LENS_GLASS_FAN) {
+                    float ang = atan2f(py, px);
+                    px += cosf(ang * ribs) * lensAmt;
+                    py += sinf(ang * ribs) * lensAmt;
+                } else if (p.lensStyle == LENS_ANAMORPHIC) {
+                    px *= (1.0f - lensAmt * 1.5f);
+                } else if (p.lensStyle == LENS_MELT) {
+                    py -= FBM3_CPU(px * 3.0f, startPhase * 0.4f) * lensAmt * 2.0f;
+                } else if (p.lensStyle == LENS_GLITCH) {
+                    float gy = floorf(py * 24.0f);
+                    px += (Hash21_CPU(gy, floorf(startPhase * 8.0f)) - 0.5f) * lensAmt * 3.0f;
+                } else if (p.lensStyle == LENS_PIXELS) {
+                    float q = (std::max)(4.0f, 80.0f * (1.0f - p.lens * 0.008f));
+                    px = floorf(px * q) / q;
+                    py = floorf(py * q) / q;
+                } else if (p.lensStyle == LENS_FLY_EYE) {
+                    float cx = Fract(px * 6.0f) - 0.5f;
+                    float cy = Fract(py * 6.0f) - 0.5f;
+                    px += cx * lensAmt * 2.5f;
+                    py += cy * lensAmt * 2.5f;
+                }
+            }
+
+            if (p.twist > 0.0f && p.mode != MODE_DROSTE && p.mode != MODE_INFINITE &&
+                p.mode != MODE_CORRIDOR && p.mode != MODE_PLANET && p.mode != MODE_SMEAR) {
+                float rr = sqrtf(px * px + py * py);
+                float ang = (p.twist * 0.01f) * 2.5f * (std::max)(0.0f, 1.4f - rr) + effHigh * 0.15f;
+                float ca = cosf(ang), sa = sinf(ang);
+                float nx = px * ca - py * sa;
+                float ny = px * sa + py * ca;
+                px = nx; py = ny;
             }
 
             float r = sqrtf(px * px + py * py);
@@ -580,6 +626,14 @@ RenderCPU(
             float freshB = fresh.blue * injectGain;
 
             float effTrail = useFeedback ? trailMix : 0.0f;
+            if (!useFeedback && p.mode != MODE_NONE && p.trails > 0.0f) {
+                // Echo trails for geometric modes (matches GPU): same-pixel history
+                int hIdx = (y * width + x) * 4;
+                advectedR = historyIn[hIdx];
+                advectedG = historyIn[hIdx + 1];
+                advectedB = historyIn[hIdx + 2];
+                effTrail = trailMix * 0.85f * 0.6f;
+            }
             float feedR = (std::max)(freshR, advectedR * retention * effTrail);
             float feedG = (std::max)(freshG, advectedG * retention * effTrail);
             float feedB = (std::max)(freshB, advectedB * retention * effTrail);
@@ -602,9 +656,38 @@ RenderCPU(
             float toneG = (p.mode == MODE_NONE) ? feedG : (1.0f - expf(-feedG * exposure));
             float toneB = (p.mode == MODE_NONE) ? feedB : (1.0f - expf(-feedB * exposure));
 
+            if (p.hueDrift > 0.0f) {
+                float hueAngle = (p.hueDrift * 0.01f) * (startPhase * 0.8f + r * 1.5f);
+                float cosA = cosf(hueAngle), sinA = sinf(hueAngle), omc = 1.0f - cosA;
+                const float k = 0.57735027f;
+                float dotV = k * (toneR + toneG + toneB);
+                float cRx = k * (toneB - toneG), cRy = k * (toneR - toneB), cRz = k * (toneG - toneR);
+                float nR = toneR * cosA + cRx * sinA + k * dotV * omc;
+                float nG = toneG * cosA + cRy * sinA + k * dotV * omc;
+                float nB = toneB * cosA + cRz * sinA + k * dotV * omc;
+                toneR = nR; toneG = nG; toneB = nB;
+            }
+
+            if (p.palette > PALETTE_CUSTOM) {
+                float luma = 0.2126f * toneR + 0.7152f * toneG + 0.0722f * toneB;
+                float palHue = static_cast<float>(p.palette - 1) * 0.261799f + startPhase * 0.05f;
+                toneR = toneR * 0.55f + luma * (0.5f + 0.5f * cosf(palHue)) * 0.65f;
+                toneG = toneG * 0.55f + luma * (0.5f + 0.5f * cosf(palHue + 2.094395f)) * 0.65f;
+                toneB = toneB * 0.55f + luma * (0.5f + 0.5f * cosf(palHue + 4.188790f)) * 0.65f;
+            }
+
             if (p.vignette > 0.0f) {
                 float vig = 1.0f - (std::min)(1.0f, (r * r) * (p.vignette * 0.01f));
                 toneR *= vig; toneG *= vig; toneB *= vig;
+            }
+
+            if (p.contrast > 0.0f) {
+                float cAmt = p.contrast * 0.006f;
+                auto sc = [cAmt](float c) {
+                    c = (std::max)(0.0f, (std::min)(1.0f, c));
+                    return c + (c * c * (3.0f - 2.0f * c) - c) * cAmt;
+                };
+                toneR = sc(toneR); toneG = sc(toneG); toneB = sc(toneB);
             }
 
             PF_PixelFloat dst;

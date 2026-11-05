@@ -551,8 +551,81 @@ int main() {
     std::cout << "  Verified distinct mode outputs against baseline: " << distinctPairs << " / 20 modes" << std::endl;
     std::cout << "  Result: " << (pass7 ? "PASS (All 21 modes produce distinct visual shaders)" : "FAIL") << std::endl;
 
+    // -------------------------------------------------------------------------
+    // TEST 8: Control Sensitivity Matrix - every global slider must change every mode
+    // -------------------------------------------------------------------------
+    std::cout << "\n[TEST 8] Control Sensitivity Matrix (global sliders x 20 modes)" << std::endl;
+    float4* d_black8 = nullptr;
+    cudaMalloc(&d_black8, numPixels * sizeof(float4));
+    cudaMemset(d_black8, 0, numPixels * sizeof(float4));
+    auto renderSeq = [&](PhotismParamsGPU mp, std::vector<float4>& out, bool cut) {
+        cudaMemset(d_hA, 0, numPixels * sizeof(float4));
+        cudaMemset(d_hB, 0, numPixels * sizeof(float4));
+        float4* a = d_hA; float4* b = d_hB;
+        for (int f = 0; f < 4; ++f) {
+            mp.frameIndex = 30 + f;
+            mp.phase = 1.25f + f * 0.08f;
+            // Last frame: content cut to black (simulates motion) so trails/decay residue is measurable
+            const float4* src = (cut && f == 3) ? d_black8 : d_src_test7;
+            LaunchSmearPipeline_CUDA(src, d_gr, a, b, d_smearOut, w, 0, w, h, mp);
+            float4* t = a; a = b; b = t;
+        }
+        cudaDeviceSynchronize();
+        out.resize(numPixels);
+        cudaMemcpy(out.data(), d_smearOut, numPixels * sizeof(float4), cudaMemcpyDeviceToHost);
+    };
+    auto alt = [](float v) { return v < 50.0f ? 90.0f : 10.0f; };
+    struct Ctl { const char* name; void (*mut)(PhotismParamsGPU&); };
+    Ctl ctls[] = {
+        {"Trails",     [](PhotismParamsGPU& q){ q.trails = q.trails < 50.f ? 95.f : 0.f; }},
+        {"Decay",      [](PhotismParamsGPU& q){ q.trails = 95.f; q.decay = q.decay < 50.f ? 100.f : 0.f; }},
+        {"Brightness", [](PhotismParamsGPU& q){ q.brightness = q.brightness < 50.f ? 95.f : 5.f; }},
+        {"InputGain",  [](PhotismParamsGPU& q){ q.inputGain = q.inputGain < 50.f ? 100.f : 10.f; }},
+        {"Symmetry",   [](PhotismParamsGPU& q){ q.symmetry = 6.f; }},
+        {"Tiles",      [](PhotismParamsGPU& q){ q.tiles = 3.f; }},
+        {"Twist",      [](PhotismParamsGPU& q){ q.twist = 80.f; }},
+        {"Slice",      [](PhotismParamsGPU& q){ q.slice = 90.f; }},
+        {"Lens",       [](PhotismParamsGPU& q){ q.lens = 80.f; q.lensStyle = LENS_GLASS_RIBS; }},
+        {"HueDrift",   [](PhotismParamsGPU& q){ q.hueDrift = 100.f; }},
+        {"Palette",    [](PhotismParamsGPU& q){ q.palette = PALETTE_CUSTOM + 3; }},
+        {"Vignette",   [](PhotismParamsGPU& q){ q.vignette = q.vignette < 50.f ? 100.f : 0.f; }},
+        {"Contrast",   [](PhotismParamsGPU& q){ q.contrast = q.contrast < 50.f ? 100.f : 0.f; }},
+        {"DryWet",     [](PhotismParamsGPU& q){ q.dryWet = q.dryWet < 50.f ? 100.f : 20.f; }},
+        {"Pulse",      [](PhotismParamsGPU& q){ q.pulse = 100.f; }},
+    };
+    (void)alt;
+    const int nCtl = sizeof(ctls) / sizeof(ctls[0]);
+    bool pass8 = true;
+    int deadCount = 0;
+    std::vector<float4> base, mod;
+    for (int mIdx = 1; mIdx < 21; ++mIdx) {
+        PhotismParamsGPU mp = smearParams;
+        mp.mode = testModes[mIdx];
+        for (int c = 0; c < nCtl; ++c) {
+            PhotismParamsGPU mq = mp;
+            ctls[c].mut(mq);
+            double d = 0.0;
+            for (int cut = 0; cut < 2; ++cut) {  // static content + motion cut; control is live if it changes either
+                renderSeq(mp, base, cut != 0);
+                renderSeq(mq, mod, cut != 0);
+                double dd = 0.0;
+                for (size_t i = 0; i < numPixels; i += 16) {
+                    dd += fabsf(mod[i].x - base[i].x) + fabsf(mod[i].y - base[i].y) + fabsf(mod[i].z - base[i].z);
+                }
+                d = (std::max)(d, dd / (numPixels / 16));
+            }
+            if (d < 0.0005) {
+                std::cout << "  DEAD: " << ctls[c].name << " in " << modeNames[mIdx] << " (diff=" << d << ")" << std::endl;
+                deadCount++;
+                pass8 = false;
+            }
+        }
+    }
+    std::cout << "  Dead control/mode pairs: " << deadCount << " / " << (20 * nCtl) << std::endl;
+    std::cout << "  Result: " << (pass8 ? "PASS (Every global control affects every mode)" : "FAIL") << std::endl;
+
     // Cleanup
-    cudaFree(d_src_test7);
+    cudaFree(d_src_test7); cudaFree(d_black8);
     cudaFree(d_dest);
     cudaFree(d_logo);
     cudaFree(d_hA);
@@ -560,7 +633,7 @@ int main() {
     cudaFree(d_gr);
     cudaFree(d_smearOut);
 
-    bool allPass = pass1 && pass2 && pass3 && pass4 && pass5 && pass6 && pass7;
+    bool allPass = pass1 && pass2 && pass3 && pass4 && pass5 && pass6 && pass7 && pass8;
     std::cout << "\n============================================================" << std::endl;
     std::cout << " FINAL STATUS: " << (allPass ? "ALL ACCEPTANCE TESTS PASSED" : "FAILED") << std::endl;
     std::cout << "============================================================" << std::endl;

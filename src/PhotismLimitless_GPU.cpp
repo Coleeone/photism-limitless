@@ -50,6 +50,7 @@ static cl_kernel sSmearKernelCache[4] = {};
 #endif
 
 class PhotismLimitlessGPU : public PrGPUFilterBase {
+    int mLastMode = -1;
 public:
     PhotismLimitlessGPU()
         : mCudaHistoryA(nullptr), mCudaHistoryB(nullptr), mCudaGradBuffer(nullptr),
@@ -228,7 +229,7 @@ public:
 
             cudaStream_t stream = reinterpret_cast<cudaStream_t>(mDeviceInfo.outCommandQueueHandle);
 
-            if (seekOccurred && (params.mode == MODE_SMEAR || params.mode == MODE_MELT || params.mode == MODE_MOSH)) {
+            if (seekOccurred || mLastMode != params.mode) {
                 // Host history is not downloaded during render (no blocking DMA), so clear instead of uploading stale data
                 cudaMemsetAsync(mCudaHistoryA, 0, static_cast<size_t>(width) * height * sizeof(float4), stream);
             }
@@ -262,6 +263,7 @@ public:
             );
 
             // Ping-pong buffer swap
+            mLastMode = params.mode;
             void* tmp = mCudaHistoryA;
             mCudaHistoryA = mCudaHistoryB;
             mCudaHistoryB = tmp;
